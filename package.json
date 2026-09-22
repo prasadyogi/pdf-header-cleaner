@@ -8,7 +8,7 @@
     "start": "next start"
   },
   "dependencies": {
-    "canvas": "^2.11.2",
+    "@napi-rs/canvas": "^1.0.9",
     "next": "14.2.35",
     "pdfjs-dist": "3.11.174",
     "react": "18.3.1",

@@ -2,9 +2,9 @@
 const nextConfig = {
   experimental: {
     // These stay external to webpack's bundle on the server: pdfjs-dist and
-    // xlsx are large, canvas is a native addon, and tesseract.js manages its
-    // own worker threads / wasm assets that don't survive bundling.
-    serverComponentsExternalPackages: ["pdfjs-dist", "xlsx", "canvas", "tesseract.js"],
+    // xlsx are large, @napi-rs/canvas is a native addon, and tesseract.js
+    // manages its own worker threads / wasm assets that don't survive bundling.
+    serverComponentsExternalPackages: ["pdfjs-dist", "xlsx", "@napi-rs/canvas", "tesseract.js"],
   },
   webpack: (config, { isServer }) => {
     if (!isServer) {
