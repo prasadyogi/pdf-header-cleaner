@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { del } from "@vercel/blob";
 import { extractTable } from "@/lib/pdfToRows";
 import { buildWorkbookBuffer } from "@/lib/buildWorkbook";
 
@@ -28,23 +29,59 @@ function parseRotations(raw: FormDataEntryValue | null): Record<number, number> 
   }
 }
 
+const PDF_NAME_RE = /\.pdf$/i;
+
 export async function POST(req: NextRequest) {
+  // Files under the ~4.4 MB Vercel request-body limit are posted directly as
+  // multipart form data (existing flow). Larger files are uploaded from the
+  // browser straight to Blob storage first (see /api/blob-upload), and the
+  // client sends us just the resulting URL as JSON instead of the bytes.
+  const isJson = (req.headers.get("content-type") || "").includes("application/json");
+
+  let buffer: Buffer;
+  let fileName: string;
+  let rotations: Record<number, number>;
+  let blobUrlToClean: string | null = null;
+
   try {
-    const formData = await req.formData();
-    const file = formData.get("file");
+    if (isJson) {
+      const body = await req.json();
+      const { blobUrl, fileName: name, rotations: rot } = body as {
+        blobUrl?: string;
+        fileName?: string;
+        rotations?: Record<number, number>;
+      };
 
-    if (!file || typeof file === "string") {
-      return NextResponse.json({ error: "No PDF file uploaded." }, { status: 400 });
+      if (!blobUrl || typeof blobUrl !== "string") {
+        return NextResponse.json({ error: "No uploaded file reference provided." }, { status: 400 });
+      }
+      fileName = typeof name === "string" && name ? name : "document.pdf";
+      if (!PDF_NAME_RE.test(fileName)) {
+        return NextResponse.json({ error: "Please upload a .pdf file." }, { status: 400 });
+      }
+      rotations = rot && typeof rot === "object" ? rot : {};
+      blobUrlToClean = blobUrl;
+
+      const blobRes = await fetch(blobUrl);
+      if (!blobRes.ok) {
+        return NextResponse.json({ error: "Could not retrieve the uploaded file." }, { status: 400 });
+      }
+      buffer = Buffer.from(await blobRes.arrayBuffer());
+    } else {
+      const formData = await req.formData();
+      const file = formData.get("file");
+
+      if (!file || typeof file === "string") {
+        return NextResponse.json({ error: "No PDF file uploaded." }, { status: 400 });
+      }
+      if (!("name" in file) || !PDF_NAME_RE.test(file.name)) {
+        return NextResponse.json({ error: "Please upload a .pdf file." }, { status: 400 });
+      }
+
+      rotations = parseRotations(formData.get("rotations"));
+      fileName = file.name;
+      buffer = Buffer.from(await file.arrayBuffer());
     }
-
-    if (!("name" in file) || !file.name.toLowerCase().endsWith(".pdf")) {
-      return NextResponse.json({ error: "Please upload a .pdf file." }, { status: 400 });
-    }
-
-    const rotations = parseRotations(formData.get("rotations"));
-
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
 
     const { header, rows, pageCount, warnings, rotationUsed, noTextLayer, usedOcr } = await extractTable(
       buffer,
@@ -73,7 +110,7 @@ export async function POST(req: NextRequest) {
 
     const xlsxBuffer = buildWorkbookBuffer(header, rows);
 
-    const outName = file.name.replace(/\.pdf$/i, "") + ".xlsx";
+    const outName = fileName.replace(PDF_NAME_RE, "") + ".xlsx";
 
     return new NextResponse(xlsxBuffer, {
       status: 200,
@@ -94,5 +131,13 @@ export async function POST(req: NextRequest) {
       { error: err?.message || "Failed to process PDF." },
       { status: 500 }
     );
+  } finally {
+    // Uploaded-to-blob files are one-shot inputs for this conversion; don't
+    // leave them sitting in storage afterward.
+    if (blobUrlToClean) {
+      del(blobUrlToClean).catch(() => {
+        // best-effort cleanup; a leftover blob isn't worth failing the request over
+      });
+    }
   }
 }

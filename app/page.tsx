@@ -1,16 +1,21 @@
 "use client";
 
 import { useRef, useState } from "react";
+import { uploadPresigned } from "@vercel/blob/client";
 import PdfCanvas from "./components/PdfCanvas";
 
 type Status = "idle" | "processing" | "done" | "error";
 type Scope = "current" | "all";
 
-// Vercel Serverless Functions cap inbound request bodies at 4.5 MB; there's
-// no way to raise this from application code, so we check client-side and
-// give a clear explanation instead of letting the upload fail with a
-// generic error.
-const MAX_UPLOAD_BYTES = 4.4 * 1024 * 1024;
+// Vercel Serverless Functions cap inbound request bodies at 4.5 MB, and
+// that can't be raised from application code. Files under this go straight
+// in the POST as before; larger ones are uploaded from the browser directly
+// to Blob storage first (bypassing that limit entirely), and we send the
+// server just the resulting URL. MAX_FILE_BYTES is this app's own overall
+// cap (matching /api/blob-upload's limit) -- past that, OCR on a huge
+// document would risk running past the function's max duration anyway.
+const DIRECT_UPLOAD_BYTES = 4.4 * 1024 * 1024;
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
 
 function normalizeAngle(deg: number): number {
   return ((deg % 360) + 360) % 360;
@@ -53,10 +58,10 @@ export default function Home() {
     }
     setFile(f);
     resetForNewFile();
-    if (f.size > MAX_UPLOAD_BYTES) {
+    if (f.size > MAX_FILE_BYTES) {
       setStatus("error");
       setMessage(
-        `This file is ${formatBytes(f.size)}, which is over the 4.4 MB upload limit for this tool. Try compressing the PDF or splitting it into smaller files.`
+        `This file is ${formatBytes(f.size)}, which is over the ${formatBytes(MAX_FILE_BYTES)} limit for this tool. Try compressing the PDF or splitting it into smaller files.`
       );
     }
   }
@@ -96,16 +101,31 @@ export default function Home() {
     setUsedOcr(false);
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("rotations", JSON.stringify(rotations));
+      let res: Response;
 
-      const res = await fetch("/api/convert", { method: "POST", body: formData });
+      if (file.size > DIRECT_UPLOAD_BYTES) {
+        // Too big for a direct POST -- upload straight to Blob storage from
+        // the browser, then just hand the server the resulting URL.
+        const blob = await uploadPresigned(file.name, file, {
+          access: "public",
+          handleUploadUrl: "/api/blob-upload",
+        });
+        res = await fetch("/api/convert", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ blobUrl: blob.url, fileName: file.name, rotations }),
+        });
+      } else {
+        const formData = new FormData();
+        formData.append("file", file);
+        formData.append("rotations", JSON.stringify(rotations));
+        res = await fetch("/api/convert", { method: "POST", body: formData });
+      }
 
       if (!res.ok) {
         if (res.status === 413) {
           throw new Error(
-            `This file is too large to upload (limit is ${formatBytes(MAX_UPLOAD_BYTES)}). Try compressing the PDF or splitting it into smaller files.`
+            `This file is too large to upload (limit is ${formatBytes(MAX_FILE_BYTES)}). Try compressing the PDF or splitting it into smaller files.`
           );
         }
         const data = await res.json().catch(() => ({}));
@@ -274,15 +294,16 @@ export default function Home() {
         <div className="actions">
           <button
             className="primary"
-            disabled={!file || status === "processing" || file.size > MAX_UPLOAD_BYTES}
+            disabled={!file || status === "processing" || file.size > MAX_FILE_BYTES}
             onClick={handleConvert}
           >
             {status === "processing" ? "Converting…" : "Convert & Download Excel"}
           </button>
           {status === "processing" && (
             <p className="hint">
-              Scanned or image-only PDFs are read automatically with OCR, which can take a
-              while for documents with many pages.
+              {file && file.size > DIRECT_UPLOAD_BYTES ? "Uploading large file… t" : "T"}hen scanned or
+              image-only PDFs are read automatically with OCR, which can take a while for documents
+              with many pages.
             </p>
           )}
         </div>
