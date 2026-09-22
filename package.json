@@ -1,0 +1,25 @@
+{
+  "name": "pdf-header-cleaner",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "canvas": "^2.11.2",
+    "next": "14.2.35",
+    "pdfjs-dist": "3.11.174",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "tesseract.js": "^7.0.0",
+    "xlsx": "0.18.5"
+  },
+  "devDependencies": {
+    "@types/node": "20.14.9",
+    "@types/react": "18.3.3",
+    "@types/react-dom": "18.3.0",
+    "typescript": "5.5.3"
+  }
+}
