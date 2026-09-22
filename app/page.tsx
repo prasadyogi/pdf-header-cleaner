@@ -6,8 +6,18 @@ import PdfCanvas from "./components/PdfCanvas";
 type Status = "idle" | "processing" | "done" | "error";
 type Scope = "current" | "all";
 
+// Vercel Serverless Functions cap inbound request bodies at 4.5 MB; there's
+// no way to raise this from application code, so we check client-side and
+// give a clear explanation instead of letting the upload fail with a
+// generic error.
+const MAX_UPLOAD_BYTES = 4.4 * 1024 * 1024;
+
 function normalizeAngle(deg: number): number {
   return ((deg % 360) + 360) % 360;
+}
+
+function formatBytes(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export default function Home() {
@@ -43,6 +53,12 @@ export default function Home() {
     }
     setFile(f);
     resetForNewFile();
+    if (f.size > MAX_UPLOAD_BYTES) {
+      setStatus("error");
+      setMessage(
+        `This file is ${formatBytes(f.size)}, which is over the 4.4 MB upload limit for this tool. Try compressing the PDF or splitting it into smaller files.`
+      );
+    }
   }
 
   function pagesInScope(): number[] {
@@ -87,6 +103,11 @@ export default function Home() {
       const res = await fetch("/api/convert", { method: "POST", body: formData });
 
       if (!res.ok) {
+        if (res.status === 413) {
+          throw new Error(
+            `This file is too large to upload (limit is ${formatBytes(MAX_UPLOAD_BYTES)}). Try compressing the PDF or splitting it into smaller files.`
+          );
+        }
         const data = await res.json().catch(() => ({}));
         if (data.needsRotation) setNeedsRotation(true);
         throw new Error(data.error || "Conversion failed.");
@@ -253,7 +274,7 @@ export default function Home() {
         <div className="actions">
           <button
             className="primary"
-            disabled={!file || status === "processing"}
+            disabled={!file || status === "processing" || file.size > MAX_UPLOAD_BYTES}
             onClick={handleConvert}
           >
             {status === "processing" ? "Converting…" : "Convert & Download Excel"}
