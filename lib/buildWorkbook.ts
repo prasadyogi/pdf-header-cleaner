@@ -3,9 +3,17 @@ import * as XLSX from "xlsx";
 // Matches amounts like "3,855.50", "-3,855.50", "0.00", "1234"
 const NUMERIC_RE = /^-?\d{1,3}(,\d{3})*(\.\d+)?$|^-?\d+(\.\d+)?$/;
 
+// A leading zero immediately followed by another digit ("0301", "007")
+// means the value is an identifier/code, not a quantity -- converting it
+// to a number would silently drop the leading zero ("0301" -> 301). A
+// decimal point after the zero ("0.00") is unaffected and still numeric.
+function hasSignificantLeadingZero(t: string): boolean {
+  return /^-?0\d/.test(t);
+}
+
 function parseNumeric(value: string): number | null {
   const t = value.trim();
-  if (!t || !NUMERIC_RE.test(t)) return null;
+  if (!t || !NUMERIC_RE.test(t) || hasSignificantLeadingZero(t)) return null;
   const n = Number(t.replace(/,/g, ""));
   return Number.isFinite(n) ? n : null;
 }

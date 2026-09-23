@@ -81,8 +81,13 @@ function normalize(text: string): string {
 function isPageArtifact(text: string): boolean {
   const t = text.trim();
   if (!t) return true;
-  // "Page 1", "Page 1 of 10", bare page numbers, common report footers
-  if (/^page\s*\d+(\s*(of|\/)\s*\d+)?$/i.test(t)) return true;
+  // "Page 1", "Page 1 of 10", bare page numbers, common report footers.
+  // Checked as a substring (not requiring the whole line to be just this)
+  // because a page-number fragment often shares a footer line with other
+  // boilerplate (a report ID, a filter description) that lands at the same
+  // y-position -- e.g. "Page 5 of 6        naguestleddetail". A line
+  // containing a page-number fragment is never *also* a real data row.
+  if (/\bpage\s*\d+(\s*(of|\/)\s*\d+)?\b/i.test(t)) return true;
   if (/^\d+\s*(\/|of)\s*\d+$/i.test(t)) return true;
   if (/^continued\b/i.test(t)) return true;
   return false;
@@ -362,13 +367,47 @@ function analyzeLines(
   for (let i = 0; i < headerAnalyzed.tokens.length - 1; i++) {
     boundaries.push((headerAnalyzed.tokens[i].right + headerAnalyzed.tokens[i + 1].x) / 2);
   }
-  const headerNorm = headerAnalyzed.norm;
+
+  // Some reports wrap column labels onto a second line (e.g. "Payment" /
+  // "Method", "Folio" / "Status"). That continuation line repeats across
+  // pages exactly like the header itself, so walk forward from the header's
+  // position (on the page it was first found) merging in each subsequent
+  // line that *also* repeats across pages -- stopping at the first one that
+  // doesn't, since that must be real data.
+  const headerNorms = new Set<string>([headerAnalyzed.norm]);
+  const samePage = analyzed
+    .filter((a) => a.line.page === headerAnalyzed!.line.page)
+    .sort((a, b) => a.line.y - b.line.y);
+  const headerIdx = samePage.findIndex((a) => a === headerAnalyzed);
+  for (let i = headerIdx + 1; i < samePage.length; i++) {
+    const candidate = samePage[i];
+    const pages = pagesByNorm.get(candidate.norm);
+    if (!pages || pages.size < 2) break; // first non-repeating line = start of real data
+    headerNorms.add(candidate.norm);
+    const cols = bucketTokens(candidate.tokens, boundaries);
+    for (let c = 0; c < header.length; c++) {
+      if (cols[c]?.text) header[c] = header[c] ? `${header[c]} ${cols[c].text}` : cols[c].text;
+    }
+  }
+
+  // Beyond the header block itself, a repeated report title/date printed on
+  // every page (not adjacent to the header, so not folded into a column
+  // label above) is still unambiguously boilerplate, not a guest row: real
+  // per-guest data can't be byte-identical across every single page the way
+  // a static title can. Drop every such line from the output rows too, even
+  // though only the adjacent ones contributed to the header text itself.
+  const excludedNorms = new Set<string>(headerNorms);
+  for (const [norm, pages] of pagesByNorm) {
+    if (pages.size >= 2 && (firstByNorm.get(norm)?.tokens.length ?? 0) >= MIN_HEADER_TOKENS) {
+      excludedNorms.add(norm);
+    }
+  }
 
   const rows: string[][] = [];
   let overcrowdedRows = 0;
 
   for (const a of analyzed) {
-    if (a.norm === headerNorm) continue; // drop the header wherever it repeats
+    if (excludedNorms.has(a.norm)) continue; // drop the header, wrapped continuation lines, and other repeated boilerplate
     if (a.tokens.length < MIN_HEADER_TOKENS) continue; // prose/cover-letter/footer, not a data row
 
     const cols = bucketTokens(a.tokens, boundaries);
@@ -653,7 +692,17 @@ export async function extractTable(
     hasExplicitRotation,
     rotations,
     (rot) => Promise.resolve(projectPages(pages, rot)),
-    /* stopAtFirstTrustworthy */ false
+    // Only search alternate rotations when the page's own declared
+    // orientation genuinely fails to produce a trustworthy table. Searching
+    // "just in case something scores higher" even after a good native
+    // reading is what caused a real regression: a dense, correctly-read
+    // financial table could still spuriously look "more structured" (more
+    // apparent columns) when read at a wrong rotation, so preferring column
+    // count once we already had a good answer was actively harmful, not
+    // just wasted work. ABSOLUTE_ROTATION_FALLBACK_ORDER's ordering (most
+    // to least likely correct) already handles picking well among
+    // alternates on the rare occasions we do need to search.
+    /* stopAtFirstTrustworthy */ true
   );
 
   if (!isTrustworthy(result)) {
