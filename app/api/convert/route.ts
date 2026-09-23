@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { del } from "@vercel/blob";
-import { extractTable } from "@/lib/pdfToRows";
+import { extractTable, extractPlainText } from "@/lib/pdfToRows";
 import { buildWorkbookBuffer } from "@/lib/buildWorkbook";
 
 export const runtime = "nodejs";
@@ -41,15 +41,17 @@ export async function POST(req: NextRequest) {
   let buffer: Buffer;
   let fileName: string;
   let rotations: Record<number, number>;
+  let mode: "excel" | "text" = "excel";
   let blobUrlToClean: string | null = null;
 
   try {
     if (isJson) {
       const body = await req.json();
-      const { blobUrl, fileName: name, rotations: rot } = body as {
+      const { blobUrl, fileName: name, rotations: rot, mode: reqMode } = body as {
         blobUrl?: string;
         fileName?: string;
         rotations?: Record<number, number>;
+        mode?: string;
       };
 
       if (!blobUrl || typeof blobUrl !== "string") {
@@ -60,6 +62,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: "Please upload a .pdf file." }, { status: 400 });
       }
       rotations = rot && typeof rot === "object" ? rot : {};
+      mode = reqMode === "text" ? "text" : "excel";
       blobUrlToClean = blobUrl;
 
       const blobRes = await fetch(blobUrl);
@@ -79,8 +82,34 @@ export async function POST(req: NextRequest) {
       }
 
       rotations = parseRotations(formData.get("rotations"));
+      mode = formData.get("mode") === "text" ? "text" : "excel";
       fileName = file.name;
       buffer = Buffer.from(await file.arrayBuffer());
+    }
+
+    if (mode === "text") {
+      const { text, pageCount, warnings, rotationUsed, usedOcr } = await extractPlainText(buffer, rotations);
+
+      if (!text.trim()) {
+        return NextResponse.json(
+          { error: "No text could be extracted from this PDF.", needsRotation: false, pageCount },
+          { status: 422 }
+        );
+      }
+
+      const outName = fileName.replace(PDF_NAME_RE, "") + ".txt";
+
+      return new NextResponse(text, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          "Content-Disposition": `attachment; filename="${outName}"`,
+          "X-Page-Count": String(pageCount),
+          "X-Rotation-Used": String(rotationUsed ?? 0),
+          "X-Used-Ocr": String(!!usedOcr),
+          "X-Warnings": encodeURIComponent(JSON.stringify(warnings)),
+        },
+      });
     }
 
     const { header, rows, pageCount, warnings, rotationUsed, noTextLayer, usedOcr } = await extractTable(

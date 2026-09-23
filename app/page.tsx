@@ -6,6 +6,7 @@ import PdfCanvas from "./components/PdfCanvas";
 
 type Status = "idle" | "processing" | "done" | "error";
 type Scope = "current" | "all";
+type OutputMode = "excel" | "text";
 
 // Vercel Serverless Functions cap inbound request bodies at 4.5 MB, and
 // that can't be raised from application code. Files under this go straight
@@ -38,6 +39,7 @@ export default function Home() {
   const [currentPage, setCurrentPage] = useState(1);
   const [rotations, setRotations] = useState<Record<number, number>>({});
   const [scope, setScope] = useState<Scope>("all");
+  const [outputMode, setOutputMode] = useState<OutputMode>("excel");
 
   function resetForNewFile() {
     setStatus("idle");
@@ -113,12 +115,13 @@ export default function Home() {
         res = await fetch("/api/convert", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ blobUrl: blob.url, fileName: file.name, rotations }),
+          body: JSON.stringify({ blobUrl: blob.url, fileName: file.name, rotations, mode: outputMode }),
         });
       } else {
         const formData = new FormData();
         formData.append("file", file);
         formData.append("rotations", JSON.stringify(rotations));
+        formData.append("mode", outputMode);
         res = await fetch("/api/convert", { method: "POST", body: formData });
       }
 
@@ -153,17 +156,21 @@ export default function Home() {
         setRotations(uniform);
       }
 
+      const ext = outputMode === "text" ? ".txt" : ".xlsx";
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = file.name.replace(/\.pdf$/i, "") + ".xlsx";
+      a.download = file.name.replace(/\.pdf$/i, "") + ext;
       document.body.appendChild(a);
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
 
       setStatus("done");
-      const base = `Done — ${rowCount ?? "your"} rows × ${colCount ?? "?"} columns exported to Excel.`;
+      const base =
+        outputMode === "text"
+          ? `Done — text extracted to a .txt file.`
+          : `Done — ${rowCount ?? "your"} rows × ${colCount ?? "?"} columns exported to Excel.`;
       setMessage(warnings.length > 0 ? `${base} ${warnings.join(" ")}` : base);
     } catch (err: any) {
       setStatus("error");
@@ -291,13 +298,37 @@ export default function Home() {
           </div>
         )}
 
+        <div className="scope-row">
+          <span className="scope-label">Convert to:</span>
+          <label>
+            <input
+              type="radio"
+              name="outputMode"
+              checked={outputMode === "excel"}
+              onChange={() => setOutputMode("excel")}
+            />
+            Excel
+          </label>
+          <label>
+            <input
+              type="radio"
+              name="outputMode"
+              checked={outputMode === "text"}
+              onChange={() => setOutputMode("text")}
+            />
+            Text
+          </label>
+        </div>
+
         <div className="actions">
           <button
             className="primary"
             disabled={!file || status === "processing" || file.size > MAX_FILE_BYTES}
             onClick={handleConvert}
           >
-            {status === "processing" ? "Converting…" : "Convert & Download Excel"}
+            {status === "processing"
+              ? "Converting…"
+              : `Convert & Download ${outputMode === "text" ? "Text" : "Excel"}`}
           </button>
           {status === "processing" && (
             <p className="hint">

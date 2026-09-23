@@ -720,3 +720,183 @@ export async function extractTable(
 
   return { header: result.header, rows: result.rows, pageCount, warnings, rotationUsed };
 }
+
+export interface PlainTextResult {
+  pageCount: number;
+  text: string;
+  usedOcr: boolean;
+  rotationUsed?: number;
+  warnings: string[];
+}
+
+/**
+ * How much of a set of lines' tokens look like real words, used to pick the
+ * correct orientation for plain-text mode. Deliberately independent of the
+ * table-shape checks (isTrustworthy) above -- this mode has no table to
+ * validate, just readable text, so a page of ordinary prose (which would
+ * fail isTrustworthy for having too few "columns") should still score well
+ * here as long as it isn't garbled.
+ */
+function textPlausibilityScore(lines: Line[]): number {
+  const allTokens = lines.flatMap((l) => lineToTokens(l, GAP_MULTIPLIER));
+  return plausibleTokenRatio(allTokens);
+}
+
+const TEXT_MODE_CONFIDENT_SCORE = 0.7;
+
+/**
+ * Plain-text extraction: no table structure required, just the page's
+ * text in reading order. For PDFs with a text layer, still auto-corrects
+ * orientation (using word-plausibility rather than table-shape as the
+ * signal) so the output isn't sideways/upside-down; falls back to OCR
+ * (confidence-based orientation, same as extractTable's OCR path) for
+ * PDFs with no text layer at all.
+ */
+export async function extractPlainText(
+  buffer: Buffer,
+  rotations: Record<number, number> = {}
+): Promise<PlainTextResult> {
+  const { pages, pageCount } = await loadPages(buffer);
+  const hasAnyText = pages.some((pd) => pd.items.length > 0);
+
+  if (!hasAnyText) {
+    const nativeRotates = Object.fromEntries(pages.map((pd) => [pd.pageNum, pd.nativeRotate]));
+    return extractPlainTextViaOcr(buffer, pageCount, nativeRotates, rotations);
+  }
+
+  const hasExplicitRotation = Object.keys(rotations).length > 0;
+  const pageNums = pages.map((pd) => pd.pageNum);
+  const nativeRotateOf = (p: number) => pages.find((pd) => pd.pageNum === p)?.nativeRotate ?? 0;
+  const baseNative = normalizeAngle(nativeRotateOf(pageNums[0]) ?? 0);
+
+  let rotationUsed: number | undefined;
+  let effectiveRotations = rotations;
+
+  if (!hasExplicitRotation) {
+    let bestAbsolute = baseNative;
+    let bestScore = textPlausibilityScore(projectPages(pages, {}));
+
+    if (bestScore < TEXT_MODE_CONFIDENT_SCORE) {
+      for (const absolute of ABSOLUTE_ROTATION_FALLBACK_ORDER) {
+        if (absolute === baseNative) continue;
+        const uniform: Record<number, number> = {};
+        for (const p of pageNums) uniform[p] = normalizeAngle(absolute - nativeRotateOf(p));
+        const score = textPlausibilityScore(projectPages(pages, uniform));
+        if (score > bestScore) {
+          bestScore = score;
+          bestAbsolute = absolute;
+        }
+        if (bestScore >= TEXT_MODE_CONFIDENT_SCORE) break;
+      }
+    }
+
+    if (bestAbsolute !== baseNative) {
+      rotationUsed = normalizeAngle(bestAbsolute - baseNative);
+      effectiveRotations = Object.fromEntries(
+        pageNums.map((p) => [p, normalizeAngle(bestAbsolute - nativeRotateOf(p))])
+      );
+    }
+  }
+
+  const lines = projectPages(pages, effectiveRotations);
+  const byPage = new Map<number, Line[]>();
+  for (const line of lines) {
+    if (!byPage.has(line.page)) byPage.set(line.page, []);
+    byPage.get(line.page)!.push(line);
+  }
+
+  const pageTexts: string[] = [];
+  for (let p = 1; p <= pageCount; p++) {
+    const pageLines = (byPage.get(p) || []).slice().sort((a, b) => a.y - b.y);
+    pageTexts.push(
+      pageLines
+        .map((l) => lineText(l))
+        .filter((t) => t !== "")
+        .join("\n")
+    );
+  }
+
+  return {
+    pageCount,
+    text: pageTexts.join("\n\n"),
+    usedOcr: false,
+    rotationUsed,
+    warnings: rotationUsed
+      ? [`Automatically detected the page was rotated ${rotationUsed}° and corrected it.`]
+      : [],
+  };
+}
+
+async function extractPlainTextViaOcr(
+  buffer: Buffer,
+  pageCount: number,
+  nativeRotates: Record<number, number>,
+  rotations: Record<number, number>
+): Promise<PlainTextResult> {
+  const hasExplicitRotation = Object.keys(rotations).length > 0;
+  const doc = await loadPdfForRendering(buffer);
+  const worker = await createWorker("eng", 1, { cachePath: path.join(os.tmpdir(), "tesseract-cache") });
+
+  try {
+    const pageCache = new Map<string, { text: string; confidence: number }>();
+    const ocrPage = async (pageNum: number, rotationsByPage: Record<number, number>) => {
+      const total = normalizeAngle((nativeRotates[pageNum] ?? 0) + (rotationsByPage[pageNum] ?? 0));
+      const cacheKey = `${pageNum}:${total}`;
+      const cached = pageCache.get(cacheKey);
+      if (cached) return cached;
+
+      const png = await renderPageToPng(doc, pageNum, total, OCR_SCALE);
+      const { data } = await worker.recognize(png, {}, { text: true });
+      const entry = { text: (data.text as string).trim(), confidence: data.confidence as number };
+      pageCache.set(cacheKey, entry);
+      return entry;
+    };
+
+    let rotationUsed: number | undefined;
+    if (!hasExplicitRotation) {
+      const baseNative = normalizeAngle(nativeRotates[1] ?? 0);
+      const candidates = [baseNative, ...ABSOLUTE_ROTATION_FALLBACK_ORDER.filter((a) => a !== baseNative)];
+      let bestAbsolute = baseNative;
+      let bestConfidence = -Infinity;
+
+      for (const absolute of candidates) {
+        const delta = normalizeAngle(absolute - baseNative);
+        const { confidence } = await ocrPage(1, { 1: delta });
+        if (confidence > bestConfidence) {
+          bestConfidence = confidence;
+          bestAbsolute = absolute;
+        }
+        if (bestConfidence >= CONFIDENT_OCR_SCORE) break;
+      }
+
+      if (bestAbsolute !== baseNative && bestConfidence >= MIN_VIABLE_OCR_SCORE) {
+        rotationUsed = normalizeAngle(bestAbsolute - baseNative);
+      }
+    }
+
+    const finalRotations: Record<number, number> = hasExplicitRotation
+      ? rotations
+      : Object.fromEntries(Array.from({ length: pageCount }, (_, i) => i + 1).map((p) => [p, rotationUsed ?? 0]));
+
+    const pageTexts: string[] = [];
+    for (let p = 1; p <= pageCount; p++) {
+      const { text } = await ocrPage(p, finalRotations);
+      pageTexts.push(text);
+    }
+
+    return {
+      pageCount,
+      text: pageTexts.join("\n\n"),
+      usedOcr: true,
+      rotationUsed,
+      warnings: [
+        "This PDF had no selectable text, so it was read with optical character recognition (OCR). Please review the text for recognition errors.",
+        ...(rotationUsed
+          ? [`Automatically detected the page was rotated ${rotationUsed}° and corrected it before running OCR.`]
+          : []),
+      ],
+    };
+  } finally {
+    await worker.terminate();
+  }
+}
